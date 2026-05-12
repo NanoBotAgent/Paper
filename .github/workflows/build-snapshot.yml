@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repo
@@ -25,38 +25,39 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            ~/.gradle/daemon
-          key: gradle-26.2-snapshot-6-${{ hashFiles('**/*.gradle.kts', 'gradle.properties', 'gradlew') }}
-          restore-keys: |
-            gradle-26.2-snapshot-6-
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission
         run: chmod +x gradlew
 
       - name: Apply Patches
+        id: apply_patches
         run: |
+          set +e
           ./gradlew applyPatches 2>&1 | tee applyPatches.log
-        continue-on-error: true
-
-      - name: Check patch status
-        run: |
-          if grep -qi "FAIL\|CONFLICT\|error\|could not apply" applyPatches.log; then
-            echo "⚠️ Patches failed - listing conflicts"
-            echo "=== FAILED PATCHES ==="
-            grep -i "FAIL\|CONFLICT\|could not apply\|error:" applyPatches.log || true
-            echo "=== CONFLICT FILES ==="
-            find . -name "*.java" -exec grep -l "<<<<<<< HEAD" {} \; 2>/dev/null || true
+          PATCH_EXIT=$?
+          set -e
+          echo "patch_exit_code=$PATCH_EXIT" >> $GITHUB_OUTPUT
+          if [ $PATCH_EXIT -ne 0 ]; then
             echo "PATCH_STATUS=FAILED" >> $GITHUB_ENV
+            echo "⚠️ Patches failed (exit code $PATCH_EXIT)"
           else
-            echo "✅ Patches applied successfully"
             echo "PATCH_STATUS=SUCCESS" >> $GITHUB_ENV
+            echo "✅ Patches applied successfully"
           fi
+
+      - name: List failed patches
+        if: env.PATCH_STATUS == 'FAILED'
+        run: |
+          echo "=== FAILED PATCHES ==="
+          grep -i "FAIL\|CONFLICT\|could not apply\|error:" applyPatches.log || true
+          echo ""
+          echo "=== CONFLICT FILES ==="
+          find . -name "*.java" -exec grep -l "<<<<<<< HEAD" {} \; 2>/dev/null || true
+          echo ""
+          echo "=== LAST 200 LINES ==="
+          tail -200 applyPatches.log
 
       - name: Upload patch log
         if: always()
@@ -66,11 +67,19 @@ jobs:
           path: applyPatches.log
           retention-days: 7
 
-      - name: Compile (if patches succeeded)
+      - name: Compile Java
         if: env.PATCH_STATUS == 'SUCCESS'
+        id: compile
         run: |
+          set +e
           ./gradlew :paper-server:compileJava 2>&1 | tee compileJava.log
-        continue-on-error: true
+          COMPILE_EXIT=$?
+          set -e
+          if [ $COMPILE_EXIT -ne 0 ]; then
+            echo "COMPILE_STATUS=FAILED" >> $GITHUB_ENV
+          else
+            echo "COMPILE_STATUS=SUCCESS" >> $GITHUB_ENV
+          fi
 
       - name: Upload compile log
         if: always()
@@ -80,11 +89,19 @@ jobs:
           path: compileJava.log
           retention-days: 7
 
-      - name: Build bundler jar (if compile succeeded)
-        if: env.PATCH_STATUS == 'SUCCESS'
+      - name: Build bundler jar
+        if: env.COMPILE_STATUS == 'SUCCESS'
+        id: build_jar
         run: |
+          set +e
           ./gradlew createMojmapBundlerJar 2>&1 | tee buildJar.log
-        continue-on-error: true
+          BUILD_EXIT=$?
+          set -e
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "BUILD_STATUS=FAILED" >> $GITHUB_ENV
+          else
+            echo "BUILD_STATUS=SUCCESS" >> $GITHUB_ENV
+          fi
 
       - name: Upload build log
         if: always()
@@ -107,18 +124,6 @@ jobs:
         if: always()
         run: |
           echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Patch status: ${{ env.PATCH_STATUS }}" >> $GITHUB_STEP_SUMMARY
-          if [ -f compileJava.log ]; then
-            if grep -qi "error\|FAIL" compileJava.log; then
-              echo "- Compile status: FAILED" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- Compile status: SUCCESS" >> $GITHUB_STEP_SUMMARY
-            fi
-          fi
-          if [ -f buildJar.log ]; then
-            if grep -qi "error\|FAIL" buildJar.log; then
-              echo "- Build status: FAILED" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- Build status: SUCCESS" >> $GITHUB_STEP_SUMMARY
-            fi
-          fi
+          echo "- Patch status: ${PATCH_STATUS:-unknown}" >> $GITHUB_STEP_SUMMARY
+          echo "- Compile status: ${COMPILE_STATUS:-skipped}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build status: ${BUILD_STATUS:-skipped}" >> $GITHUB_STEP_SUMMARY
