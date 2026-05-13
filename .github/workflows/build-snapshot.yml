@@ -31,11 +31,16 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew
 
+      - name: Configure Git
+        run: |
+          git config --global user.email "no-reply@github.com"
+          git config --global user.name "GitHub Actions"
+
       - name: Apply Patches
         id: apply_patches
         run: |
           set +e
-          ./gradlew applyPatches 2>&1 | tee applyPatches.log
+          ./gradlew applyPatches --stacktrace 2>&1 | tee applyPatches.log
           PATCH_EXIT=$?
           set -e
           echo "patch_exit_code=$PATCH_EXIT" >> $GITHUB_OUTPUT
@@ -56,8 +61,11 @@ jobs:
           echo "=== CONFLICT FILES ==="
           find . -name "*.java" -exec grep -l "<<<<<<< HEAD" {} \; 2>/dev/null || true
           echo ""
-          echo "=== LAST 300 LINES ==="
-          tail -300 applyPatches.log
+          echo "=== PATCH HUNK FAILURES ==="
+          grep -B2 "FAILED\|cannot apply\|reject" applyPatches.log | head -100 || true
+          echo ""
+          echo "=== LAST 500 LINES ==="
+          tail -500 applyPatches.log
 
       - name: Upload patch log
         if: always()
@@ -98,7 +106,7 @@ jobs:
           grep -c "error:" compileJava.log || echo "0"
 
       - name: Upload compile log
-        if: always()
+        if: always() && env.PATCH_STATUS == 'SUCCESS'
         uses: actions/upload-artifact@v4
         with:
           name: compileJava-log
@@ -115,7 +123,6 @@ jobs:
         id: build_jar
         run: |
           set +e
-          # Try the known task name, fallback to alternatives
           ./gradlew createMojmapBundlerJar 2>&1 | tee buildJar.log
           if [ $? -ne 0 ]; then
             echo "createMojmapBundlerJar failed, trying alternatives..."
@@ -130,7 +137,7 @@ jobs:
           fi
 
       - name: Upload build log
-        if: always()
+        if: always() && env.COMPILE_STATUS == 'SUCCESS'
         uses: actions/upload-artifact@v4
         with:
           name: buildJar-log
