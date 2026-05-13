@@ -4,6 +4,11 @@ on:
   push:
     branches: [ "26.2-snapshot-6" ]
   workflow_dispatch:
+    inputs:
+      skip_mache_patches:
+        description: 'Skip broken mache patches and apply fixes manually'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -36,13 +41,24 @@ jobs:
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
-      - name: Apply Patches
+      # Step 1: Remove the broken mache dependency so setupMacheSources skips mache patches
+      - name: Patch out mache patches from build
+        if: inputs.skip_mache_patches == true
+        run: |
+          # Modify build.gradle.kts to remove mache dependency
+          cd paper-server
+          # Comment out the mache line
+          sed -i 's|^\s*mache("io.papermc:mache:.*")|// mache("io.papermc:mache:26.2-snapshot-6+build.1") // Disabled: patches fail with line number offset|' build.gradle.kts
+          echo "=== Modified mache line ==="
+          grep -n "mache\|Disabled" build.gradle.kts
+
+      - name: Apply Patches (without mache patches)
         id: apply_patches
         run: |
           ./gradlew applyPatches --stacktrace 2>&1 | tee applyPatches.log
         continue-on-error: true
 
-      - name: Check patch result and dump decompiled source
+      - name: Check patch result
         if: always()
         run: |
           if grep -q "Failed to apply.*mache patches\|BUILD FAILED" applyPatches.log 2>/dev/null; then
@@ -51,65 +67,45 @@ jobs:
             grep -i "Patching:\|Hunk.*FAILURE\|Failed to apply" applyPatches.log || true
           else
             echo "PATCH_STATUS=SUCCESS" >> $GITHUB_ENV
+            echo "=== Patch succeeded ==="
           fi
 
-          echo ""
-          echo "=== SEARCHING FOR DECOMPILED MACHE SOURCE ==="
-          # The decompiled source is in the mache cache
-          # Multiple possible locations:
-          # 1. paper-server/.gradle/caches/paperweight/mache/base/sources/ (current version)
-          # 2. paper-server/src/minecraft/java/ (after successful setupMacheSources)
-          # 3. Various task output directories
-
-          echo "--- mache base sources ---"
-          find paper-server/.gradle/caches/paperweight/mache -name "*.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
-
-          echo "--- mache decompile output ---"
-          find paper-server/build -name "*.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
-
-          echo "--- paperweight task cache ---"
-          find paper-server/.gradle/caches/paperweight -maxdepth 5 -type d -name "sources" -not -path "*/oldPaper/*" 2>/dev/null | head -10 || true
-
-          echo "--- All .java in mache cache (not oldPaper) ---"
-          find paper-server/.gradle/caches/paperweight/mache -name "LivingEntity.java" -not -path "*/oldPaper/*" 2>/dev/null || true
-
-          echo "--- Decompile task output ---"
-          find paper-server/build/tmp -name "*.java" 2>/dev/null | head -5 || true
-          find paper-server/build/mache -name "*.java" 2>/dev/null | head -5 || true
-
-          # Also check the Gradle user home cache
-          echo "--- Gradle user home mache cache ---"
-          find /home/runner/.gradle/caches -name "LivingEntity.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
-
-          # Try to extract from the decompiled jar in the taskCache
-          echo ""
-          echo "=== EXTRACTING FROM DECOMPILE JAR ==="
-          DECOMPILE_JAR=$(find paper-server/.gradle/caches/paperweight -name "decompileJar.jar" -not -path "*/oldPaper/*" 2>/dev/null | head -1)
-          if [ -n "$DECOMPILE_JAR" ]; then
-            echo "Found decompile jar: $DECOMPILE_JAR"
-            mkdir -p /tmp/vanilla-src
-            cd /tmp/vanilla-src
-            jar xf "$GITHUB_WORKSPACE/$DECOMPILE_JAR" 2>/dev/null || true
-            LIVING=$(find . -name "LivingEntity.java" -path "*/world/entity/*" 2>/dev/null | head -1)
-            if [ -n "$LIVING" ]; then
-              echo "=== 26.2 LivingEntity.java lines 1160-1200 (around hunk 1176) ==="
-              sed -n '1160,1200p' "$LIVING" || true
-              echo ""
-              echo "=== 26.2 LivingEntity.java lines 1250-1290 (around hunk 1268) ==="
-              sed -n '1250,1290p' "$LIVING" || true
-            else
-              echo "LivingEntity.java not found in decompile jar"
-            fi
-            CLIMATE=$(find . -name "Climate.java" -path "*/biome/*" 2>/dev/null | head -1)
-            if [ -n "$CLIMATE" ]; then
-              echo "=== 26.2 Climate.java lines 260-280 (around hunk 268) ==="
-              sed -n '260,280p' "$CLIMATE" || true
-            fi
+      # Step 2: If patches succeeded (without mache), apply the mache fixes manually via sed
+      - name: Apply mache fixes manually
+        if: env.PATCH_STATUS == 'SUCCESS'
+        run: |
+          echo "=== Applying mache fixes manually ==="
+          
+          # Fix 1: LivingEntity.java - add float originalDamage = damage;
+          LIVING=$(find paper-server/src/minecraft/java -name "LivingEntity.java" -path "*/world/entity/*" 2>/dev/null | head -1)
+          if [ -n "$LIVING" ]; then
+            echo "Found LivingEntity.java at: $LIVING"
+            echo "Applying fix: add originalDamage variable before itemInUse"
+            # Add "float originalDamage = damage;" before "ItemStack itemInUse"
+            sed -i '/ItemStack itemInUse = this.getUseItem();/i\        float originalDamage = damage;' "$LIVING"
+            
+            # Fix 2: LivingEntity.java - replace damage,damage with originalDamage,damage in CriteriaTriggers
+            echo "Applying fix: replace damage,damage with originalDamage,damage in CriteriaTriggers"
+            sed -i 's/CriteriaTriggers\.ENTITY_HURT_PLAYER\.trigger(serverPlayer, source, damage, damage, blocked)/CriteriaTriggers.ENTITY_HURT_PLAYER.trigger(serverPlayer, source, originalDamage, damage, blocked)/' "$LIVING"
+            sed -i 's/CriteriaTriggers\.PLAYER_HURT_ENTITY\.trigger(sourcePlayer, this, source, damage, damage, blocked)/CriteriaTriggers.PLAYER_HURT_ENTITY.trigger(sourcePlayer, this, source, originalDamage, damage, blocked)/' "$LIVING"
+            
+            echo "=== Verify fixes ==="
+            grep -n "originalDamage" "$LIVING" || echo "ERROR: originalDamage not found"
           else
-            echo "No decompile jar found"
-            # Try listing all paperweight cache dirs
-            echo "--- paperweight cache directory tree ---"
-            find paper-server/.gradle/caches/paperweight -maxdepth 3 -type d -not -path "*/oldPaper/*" 2>/dev/null | head -30 || true
+            echo "ERROR: LivingEntity.java not found"
+          fi
+          
+          # Fix 3: Climate.java - add diamond operator to RTree.Leaf constructor
+          CLIMATE=$(find paper-server/src/minecraft/java -name "Climate.java" -path "*/biome/*" 2>/dev/null | head -1)
+          if [ -n "$CLIMATE" ]; then
+            echo "Found Climate.java at: $CLIMATE"
+            echo "Applying fix: add diamond operator to RTree.Leaf"
+            sed -i 's/new Climate\.RTree\.Leaf(p\.getFirst(), p\.getSecond())/new Climate.RTree.Leaf<>(p.getFirst(), p.getSecond())/' "$CLIMATE"
+            
+            echo "=== Verify fix ==="
+            grep -n "RTree.Leaf<>" "$CLIMATE" || echo "ERROR: diamond operator not found"
+          else
+            echo "ERROR: Climate.java not found"
           fi
 
       - name: Upload patch log
@@ -120,6 +116,7 @@ jobs:
           path: applyPatches.log
           retention-days: 7
 
+      # Step 3: Compile with manual mache fixes applied
       - name: Compile Java
         if: env.PATCH_STATUS == 'SUCCESS'
         id: compile
