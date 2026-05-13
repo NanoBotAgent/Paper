@@ -41,10 +41,10 @@ jobs:
           echo "patch_exit_code=$PATCH_EXIT" >> $GITHUB_OUTPUT
           if [ $PATCH_EXIT -ne 0 ]; then
             echo "PATCH_STATUS=FAILED" >> $GITHUB_ENV
-            echo "⚠️ Patches failed (exit code $PATCH_EXIT)"
+            echo "Patches failed (exit code $PATCH_EXIT)"
           else
             echo "PATCH_STATUS=SUCCESS" >> $GITHUB_ENV
-            echo "✅ Patches applied successfully"
+            echo "Patches applied successfully"
           fi
 
       - name: List failed patches
@@ -56,8 +56,8 @@ jobs:
           echo "=== CONFLICT FILES ==="
           find . -name "*.java" -exec grep -l "<<<<<<< HEAD" {} \; 2>/dev/null || true
           echo ""
-          echo "=== LAST 200 LINES ==="
-          tail -200 applyPatches.log
+          echo "=== LAST 300 LINES ==="
+          tail -300 applyPatches.log
 
       - name: Upload patch log
         if: always()
@@ -75,11 +75,27 @@ jobs:
           ./gradlew :paper-server:compileJava 2>&1 | tee compileJava.log
           COMPILE_EXIT=$?
           set -e
+          echo "compile_exit_code=$COMPILE_EXIT" >> $GITHUB_OUTPUT
           if [ $COMPILE_EXIT -ne 0 ]; then
             echo "COMPILE_STATUS=FAILED" >> $GITHUB_ENV
           else
             echo "COMPILE_STATUS=SUCCESS" >> $GITHUB_ENV
           fi
+
+      - name: Extract compile errors
+        if: env.COMPILE_STATUS == 'FAILED'
+        run: |
+          echo "=== COMPILE ERROR SUMMARY ==="
+          grep "error:" compileJava.log | sort -u | head -200
+          echo ""
+          echo "=== UNIQUE MISSING PACKAGES ==="
+          grep "package .* does not exist" compileJava.log | sed 's/.*package //' | sed 's/ does not exist.*//' | sort -u
+          echo ""
+          echo "=== UNIQUE MISSING SYMBOLS ==="
+          grep "cannot find symbol" compileJava.log | sort -u | head -50
+          echo ""
+          echo "=== FULL ERROR COUNT ==="
+          grep -c "error:" compileJava.log || echo "0"
 
       - name: Upload compile log
         if: always()
@@ -89,18 +105,28 @@ jobs:
           path: compileJava.log
           retention-days: 7
 
-      - name: Build bundler jar
+      - name: List available Gradle tasks
+        if: env.COMPILE_STATUS == 'SUCCESS'
+        run: |
+          ./gradlew tasks --all 2>&1 | grep -i "bundler\|paperclip\|mojmap\|jar\|shadow\|createMojmap\|createPaperclip" || true
+
+      - name: Build jar
         if: env.COMPILE_STATUS == 'SUCCESS'
         id: build_jar
         run: |
           set +e
+          # Try the known task name, fallback to alternatives
           ./gradlew createMojmapBundlerJar 2>&1 | tee buildJar.log
+          if [ $? -ne 0 ]; then
+            echo "createMojmapBundlerJar failed, trying alternatives..."
+            ./gradlew tasks --all 2>&1 | grep -i "jar" | tee -a buildJar.log
+          fi
           BUILD_EXIT=$?
           set -e
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo "BUILD_STATUS=FAILED" >> $GITHUB_ENV
-          else
+          if [ $BUILD_EXIT -eq 0 ]; then
             echo "BUILD_STATUS=SUCCESS" >> $GITHUB_ENV
+          else
+            echo "BUILD_STATUS=FAILED" >> $GITHUB_ENV
           fi
 
       - name: Upload build log
@@ -116,7 +142,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: paper-server-jar
-          path: paper-server/build/libs/*.jar
+          path: |
+            paper-server/build/libs/*.jar
+            paper-server/build/libs/*/*.jar
           retention-days: 14
           if-no-files-found: ignore
 
