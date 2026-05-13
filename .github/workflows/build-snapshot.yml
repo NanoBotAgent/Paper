@@ -4,11 +4,6 @@ on:
   push:
     branches: [ "26.2-snapshot-6" ]
   workflow_dispatch:
-    inputs:
-      skip_mache_patches:
-        description: 'Skip broken mache patches and apply fixes manually'
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -41,16 +36,16 @@ jobs:
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
-      # Step 1: Remove the broken mache dependency so setupMacheSources skips mache patches
-      - name: Patch out mache patches from build
-        if: inputs.skip_mache_patches == true
+      # The mache 26.2-snapshot-6+build.1 patches fail due to line number offset.
+      # Disable mache so setupMacheSources skips mache patch application,
+      # then we'll apply the fixes manually via sed after decompile.
+      - name: Disable broken mache patches
         run: |
-          # Modify build.gradle.kts to remove mache dependency
           cd paper-server
-          # Comment out the mache line
-          sed -i 's|^\s*mache("io.papermc:mache:.*")|// mache("io.papermc:mache:26.2-snapshot-6+build.1") // Disabled: patches fail with line number offset|' build.gradle.kts
+          # Comment out the mache dependency line
+          sed -i 's|mache("io.papermc:mache:.*")|// mache disabled - patches have wrong line numbers|' build.gradle.kts
           echo "=== Modified mache line ==="
-          grep -n "mache\|Disabled" build.gradle.kts
+          grep -n "mache\|disabled" build.gradle.kts
 
       - name: Apply Patches (without mache patches)
         id: apply_patches
@@ -70,7 +65,7 @@ jobs:
             echo "=== Patch succeeded ==="
           fi
 
-      # Step 2: If patches succeeded (without mache), apply the mache fixes manually via sed
+      # Apply the 3 mache fixes manually via sed on the decompiled source
       - name: Apply mache fixes manually
         if: env.PATCH_STATUS == 'SUCCESS'
         run: |
@@ -80,32 +75,33 @@ jobs:
           LIVING=$(find paper-server/src/minecraft/java -name "LivingEntity.java" -path "*/world/entity/*" 2>/dev/null | head -1)
           if [ -n "$LIVING" ]; then
             echo "Found LivingEntity.java at: $LIVING"
-            echo "Applying fix: add originalDamage variable before itemInUse"
-            # Add "float originalDamage = damage;" before "ItemStack itemInUse"
+            echo "Fix 1: add originalDamage variable before itemInUse"
             sed -i '/ItemStack itemInUse = this.getUseItem();/i\        float originalDamage = damage;' "$LIVING"
             
             # Fix 2: LivingEntity.java - replace damage,damage with originalDamage,damage in CriteriaTriggers
-            echo "Applying fix: replace damage,damage with originalDamage,damage in CriteriaTriggers"
+            echo "Fix 2: replace damage,damage with originalDamage,damage in CriteriaTriggers"
             sed -i 's/CriteriaTriggers\.ENTITY_HURT_PLAYER\.trigger(serverPlayer, source, damage, damage, blocked)/CriteriaTriggers.ENTITY_HURT_PLAYER.trigger(serverPlayer, source, originalDamage, damage, blocked)/' "$LIVING"
             sed -i 's/CriteriaTriggers\.PLAYER_HURT_ENTITY\.trigger(sourcePlayer, this, source, damage, damage, blocked)/CriteriaTriggers.PLAYER_HURT_ENTITY.trigger(sourcePlayer, this, source, originalDamage, damage, blocked)/' "$LIVING"
             
             echo "=== Verify fixes ==="
-            grep -n "originalDamage" "$LIVING" || echo "ERROR: originalDamage not found"
+            grep -n "originalDamage" "$LIVING"
           else
-            echo "ERROR: LivingEntity.java not found"
+            echo "ERROR: LivingEntity.java not found in decompiled source"
+            find paper-server/src -name "LivingEntity.java" 2>/dev/null | head -5
           fi
           
           # Fix 3: Climate.java - add diamond operator to RTree.Leaf constructor
           CLIMATE=$(find paper-server/src/minecraft/java -name "Climate.java" -path "*/biome/*" 2>/dev/null | head -1)
           if [ -n "$CLIMATE" ]; then
             echo "Found Climate.java at: $CLIMATE"
-            echo "Applying fix: add diamond operator to RTree.Leaf"
+            echo "Fix 3: add diamond operator to RTree.Leaf"
             sed -i 's/new Climate\.RTree\.Leaf(p\.getFirst(), p\.getSecond())/new Climate.RTree.Leaf<>(p.getFirst(), p.getSecond())/' "$CLIMATE"
             
             echo "=== Verify fix ==="
-            grep -n "RTree.Leaf<>" "$CLIMATE" || echo "ERROR: diamond operator not found"
+            grep -n "RTree.Leaf<>" "$CLIMATE"
           else
-            echo "ERROR: Climate.java not found"
+            echo "ERROR: Climate.java not found in decompiled source"
+            find paper-server/src -name "Climate.java" 2>/dev/null | head -5
           fi
 
       - name: Upload patch log
