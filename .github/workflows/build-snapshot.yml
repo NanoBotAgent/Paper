@@ -39,33 +39,48 @@ jobs:
       - name: Apply Patches
         id: apply_patches
         run: |
-          set +e
           ./gradlew applyPatches --stacktrace 2>&1 | tee applyPatches.log
-          PATCH_EXIT=$?
-          set -e
-          echo "patch_exit_code=$PATCH_EXIT" >> $GITHUB_OUTPUT
-          if [ $PATCH_EXIT -ne 0 ]; then
+        continue-on-error: true
+
+      - name: Check patch result
+        id: check_patches
+        run: |
+          if grep -q "FAILED\|BUILD FAILED" applyPatches.log; then
             echo "PATCH_STATUS=FAILED" >> $GITHUB_ENV
-            echo "Patches failed (exit code $PATCH_EXIT)"
           else
             echo "PATCH_STATUS=SUCCESS" >> $GITHUB_ENV
-            echo "Patches applied successfully"
           fi
 
-      - name: List failed patches
+      - name: Dump failing context
         if: env.PATCH_STATUS == 'FAILED'
         run: |
-          echo "=== FAILED PATCHES ==="
-          grep -i "FAIL\|CONFLICT\|could not apply\|error:" applyPatches.log || true
+          echo "=== MACHE PATCH FAILURES ==="
+          grep -i "Patching:\|Hunk.*FAILURE\|Failed to apply" applyPatches.log || true
           echo ""
-          echo "=== CONFLICT FILES ==="
-          find . -name "*.java" -exec grep -l "<<<<<<< HEAD" {} \; 2>/dev/null || true
+          echo "=== LOOKING FOR DECOMPILED SOURCE ==="
+          find . -path "*/src/minecraft/java/net/minecraft/world/entity/LivingEntity.java" 2>/dev/null || true
+          find . -path "*/src/minecraft/java/net/minecraft/world/level/biome/Climate.java" 2>/dev/null || true
           echo ""
-          echo "=== PATCH HUNK FAILURES ==="
-          grep -B2 "FAILED\|cannot apply\|reject" applyPatches.log | head -100 || true
+          echo "=== DECOMPILED LivingEntity.java around lines 1170-1290 ==="
+          LIVING=$(find . -path "*/src/minecraft/java/net/minecraft/world/entity/LivingEntity.java" 2>/dev/null | head -1)
+          if [ -n "$LIVING" ]; then
+            sed -n '1160,1200p' "$LIVING" 2>/dev/null || true
+            echo "--- gap ---"
+            sed -n '1255,1295p' "$LIVING" 2>/dev/null || true
+          else
+            echo "LivingEntity.java not found (mache may not have extracted it yet)"
+          fi
           echo ""
-          echo "=== LAST 500 LINES ==="
-          tail -500 applyPatches.log
+          echo "=== DECOMPILED Climate.java around lines 260-280 ==="
+          CLIMATE=$(find . -path "*/src/minecraft/java/net/minecraft/world/level/biome/Climate.java" 2>/dev/null | head -1)
+          if [ -n "$CLIMATE" ]; then
+            sed -n '255,285p' "$CLIMATE" 2>/dev/null || true
+          else
+            echo "Climate.java not found"
+          fi
+          echo ""
+          echo "=== LAST 300 LINES ==="
+          tail -300 applyPatches.log
 
       - name: Upload patch log
         if: always()
@@ -79,31 +94,28 @@ jobs:
         if: env.PATCH_STATUS == 'SUCCESS'
         id: compile
         run: |
-          set +e
           ./gradlew :paper-server:compileJava 2>&1 | tee compileJava.log
-          COMPILE_EXIT=$?
-          set -e
-          echo "compile_exit_code=$COMPILE_EXIT" >> $GITHUB_OUTPUT
-          if [ $COMPILE_EXIT -ne 0 ]; then
+        continue-on-error: true
+
+      - name: Check compile result
+        if: env.PATCH_STATUS == 'SUCCESS'
+        run: |
+          if grep -q "BUILD FAILED\|error:" compileJava.log 2>/dev/null; then
             echo "COMPILE_STATUS=FAILED" >> $GITHUB_ENV
+            echo "=== COMPILE ERROR SUMMARY ==="
+            grep "error:" compileJava.log | sort -u | head -200
+            echo ""
+            echo "=== UNIQUE MISSING PACKAGES ==="
+            grep "package .* does not exist" compileJava.log | sed 's/.*package //' | sed 's/ does not exist.*//' | sort -u
+            echo ""
+            echo "=== UNIQUE MISSING SYMBOLS ==="
+            grep "cannot find symbol" compileJava.log | sort -u | head -50
+            echo ""
+            echo "=== FULL ERROR COUNT ==="
+            grep -c "error:" compileJava.log || echo "0"
           else
             echo "COMPILE_STATUS=SUCCESS" >> $GITHUB_ENV
           fi
-
-      - name: Extract compile errors
-        if: env.COMPILE_STATUS == 'FAILED'
-        run: |
-          echo "=== COMPILE ERROR SUMMARY ==="
-          grep "error:" compileJava.log | sort -u | head -200
-          echo ""
-          echo "=== UNIQUE MISSING PACKAGES ==="
-          grep "package .* does not exist" compileJava.log | sed 's/.*package //' | sed 's/ does not exist.*//' | sort -u
-          echo ""
-          echo "=== UNIQUE MISSING SYMBOLS ==="
-          grep "cannot find symbol" compileJava.log | sort -u | head -50
-          echo ""
-          echo "=== FULL ERROR COUNT ==="
-          grep -c "error:" compileJava.log || echo "0"
 
       - name: Upload compile log
         if: always() && env.PATCH_STATUS == 'SUCCESS'
@@ -122,19 +134,22 @@ jobs:
         if: env.COMPILE_STATUS == 'SUCCESS'
         id: build_jar
         run: |
-          set +e
-          ./gradlew createMojmapBundlerJar 2>&1 | tee buildJar.log
-          if [ $? -ne 0 ]; then
-            echo "createMojmapBundlerJar failed, trying alternatives..."
-            ./gradlew tasks --all 2>&1 | grep -i "jar" | tee -a buildJar.log
-          fi
-          BUILD_EXIT=$?
-          set -e
-          if [ $BUILD_EXIT -eq 0 ]; then
-            echo "BUILD_STATUS=SUCCESS" >> $GITHUB_ENV
-          else
+          # Try multiple task names - paperweight 2.0 may have changed them
+          for task in createMojmapBundlerJar createBundlerJar paperclipJar createPaperclipJar shadowJar; do
+            echo "Trying task: $task"
+            if ./gradlew $task 2>&1 | tee buildJar.log; then
+              echo "BUILD_STATUS=SUCCESS" >> $GITHUB_ENV
+              break
+            else
+              echo "$task failed, trying next..."
+            fi
+          done
+          if [ "${BUILD_STATUS:-FAILED}" != "SUCCESS" ]; then
             echo "BUILD_STATUS=FAILED" >> $GITHUB_ENV
+            echo "=== Available jar tasks ==="
+            ./gradlew tasks --all 2>&1 | grep -i "jar" | tee -a buildJar.log || true
           fi
+        continue-on-error: true
 
       - name: Upload build log
         if: always() && env.COMPILE_STATUS == 'SUCCESS'
