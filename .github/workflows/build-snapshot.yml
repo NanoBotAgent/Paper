@@ -1,8 +1,8 @@
-name: Build Paper 26.2-snapshot-6
+name: Build Paper 26.2-snapshot-7
 
 on:
   push:
-    branches: [ "26.2-snapshot-6" ]
+    branches: [ "26.2-snapshot-7" ]
   workflow_dispatch:
 
 permissions:
