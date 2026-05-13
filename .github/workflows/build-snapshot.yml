@@ -36,13 +36,13 @@ jobs:
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
-      - name: Apply Patches (with decompiled source extraction)
+      - name: Apply Patches
         id: apply_patches
         run: |
           ./gradlew applyPatches --stacktrace 2>&1 | tee applyPatches.log
         continue-on-error: true
 
-      - name: Check patch result and dump vanilla source
+      - name: Check patch result and dump decompiled source
         if: always()
         run: |
           if grep -q "Failed to apply.*mache patches\|BUILD FAILED" applyPatches.log 2>/dev/null; then
@@ -54,78 +54,62 @@ jobs:
           fi
 
           echo ""
-          echo "=== LOOKING FOR DECOMPILED SOURCE ==="
-          # The decompiled source is extracted by setupMacheSources before patching
-          # It should be in paper-server/src/minecraft/java/ or similar
-          find paper-server -name "LivingEntity.java" -not -path "*/patches/*" 2>/dev/null | head -5 || true
-          find paper-server -name "Climate.java" -not -path "*/patches/*" 2>/dev/null | head -5 || true
+          echo "=== SEARCHING FOR DECOMPILED MACHE SOURCE ==="
+          # The decompiled source is in the mache cache
+          # Multiple possible locations:
+          # 1. paper-server/.gradle/caches/paperweight/mache/base/sources/ (current version)
+          # 2. paper-server/src/minecraft/java/ (after successful setupMacheSources)
+          # 3. Various task output directories
 
-          # Also check the Gradle cache for the decompiled jar
+          echo "--- mache base sources ---"
+          find paper-server/.gradle/caches/paperweight/mache -name "*.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
+
+          echo "--- mache decompile output ---"
+          find paper-server/build -name "*.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
+
+          echo "--- paperweight task cache ---"
+          find paper-server/.gradle/caches/paperweight -maxdepth 5 -type d -name "sources" -not -path "*/oldPaper/*" 2>/dev/null | head -10 || true
+
+          echo "--- All .java in mache cache (not oldPaper) ---"
+          find paper-server/.gradle/caches/paperweight/mache -name "LivingEntity.java" -not -path "*/oldPaper/*" 2>/dev/null || true
+
+          echo "--- Decompile task output ---"
+          find paper-server/build/tmp -name "*.java" 2>/dev/null | head -5 || true
+          find paper-server/build/mache -name "*.java" 2>/dev/null | head -5 || true
+
+          # Also check the Gradle user home cache
+          echo "--- Gradle user home mache cache ---"
+          find /home/runner/.gradle/caches -name "LivingEntity.java" -not -path "*/oldPaper/*" 2>/dev/null | head -5 || true
+
+          # Try to extract from the decompiled jar in the taskCache
           echo ""
-          echo "=== MACHE CACHE FILES ==="
-          find paper-server/.gradle -name "*.jar" 2>/dev/null | head -10 || true
-          find paper-server/build -name "*.jar" -not -path "*/libs/*" 2>/dev/null | head -10 || true
-
-          # Try to find the extracted decompiled source directory
-          echo ""
-          echo "=== PAPER-SERVER DIR STRUCTURE ==="
-          ls -la paper-server/src/ 2>/dev/null || true
-          find paper-server/src -maxdepth 3 -type d 2>/dev/null | head -20 || true
-
-      - name: Extract decompiled vanilla source from cache
-        if: env.PATCH_STATUS == 'FAILED'
-        run: |
-          # Find the decompiled jar in Gradle cache
-          DECOMPILED_JAR=$(find paper-server/.gradle -name "*.jar" -path "*mache*" 2>/dev/null | head -1)
-          if [ -z "$DECOMPILED_JAR" ]; then
-            DECOMPILED_JAR=$(find paper-server/.gradle -name "*decompile*" -name "*.jar" 2>/dev/null | head -1)
-          fi
-          if [ -z "$DECOMPILED_JAR" ]; then
-            # Try finding any jar that might contain decompiled source
-            DECOMPILED_JAR=$(find paper-server/.gradle -name "sources*.jar" 2>/dev/null | head -1)
-          fi
-
-          if [ -n "$DECOMPILED_JAR" ]; then
-            echo "Found decompiled jar: $DECOMPILED_JAR"
+          echo "=== EXTRACTING FROM DECOMPILE JAR ==="
+          DECOMPILE_JAR=$(find paper-server/.gradle/caches/paperweight -name "decompileJar.jar" -not -path "*/oldPaper/*" 2>/dev/null | head -1)
+          if [ -n "$DECOMPILE_JAR" ]; then
+            echo "Found decompile jar: $DECOMPILE_JAR"
             mkdir -p /tmp/vanilla-src
             cd /tmp/vanilla-src
-            jar xf "$DECOMPILED_JAR" 2>/dev/null || unzip -o "$DECOMPILED_JAR" 2>/dev/null || true
-            echo "=== LivingEntity.java around lines 1170-1190 ==="
+            jar xf "$GITHUB_WORKSPACE/$DECOMPILE_JAR" 2>/dev/null || true
             LIVING=$(find . -name "LivingEntity.java" -path "*/world/entity/*" 2>/dev/null | head -1)
             if [ -n "$LIVING" ]; then
-              sed -n '1160,1200p' "$LIVING" 2>/dev/null || true
+              echo "=== 26.2 LivingEntity.java lines 1160-1200 (around hunk 1176) ==="
+              sed -n '1160,1200p' "$LIVING" || true
               echo ""
-              echo "=== Lines 1250-1290 ==="
-              sed -n '1250,1290p' "$LIVING" 2>/dev/null || true
-              echo ""
-              echo "=== HurtByTimestamp search ==="
-              grep -n "HurtByTimestamp\|hurtByTimestamp\|ticks_since_last_hurt" "$LIVING" 2>/dev/null || echo "Not found"
-              echo ""
-              echo "=== Total lines ==="
-              wc -l "$LIVING" 2>/dev/null || true
+              echo "=== 26.2 LivingEntity.java lines 1250-1290 (around hunk 1268) ==="
+              sed -n '1250,1290p' "$LIVING" || true
             else
-              echo "LivingEntity.java not found in jar"
-              find . -name "*.java" -path "*/entity/*" | head -10 || true
+              echo "LivingEntity.java not found in decompile jar"
             fi
-            echo ""
             CLIMATE=$(find . -name "Climate.java" -path "*/biome/*" 2>/dev/null | head -1)
             if [ -n "$CLIMATE" ]; then
-              echo "=== Climate.java around lines 255-285 ==="
-              sed -n '255,285p' "$CLIMATE" 2>/dev/null || true
-            else
-              echo "Climate.java not found in jar"
+              echo "=== 26.2 Climate.java lines 260-280 (around hunk 268) ==="
+              sed -n '260,280p' "$CLIMATE" || true
             fi
           else
-            echo "No decompiled jar found in cache"
-            # Try to extract from the Gradle cache more broadly
-            echo "=== All jars in .gradle ==="
-            find paper-server/.gradle -name "*.jar" 2>/dev/null | head -20 || true
-            echo ""
-            echo "=== All .java in mache cache ==="
-            find paper-server/.gradle/caches/paperweight/mache -name "*.java" 2>/dev/null | head -10 || true
-            echo ""
-            echo "=== Mache cache directory listing ==="
-            ls -laR paper-server/.gradle/caches/paperweight/mache/ 2>/dev/null | head -50 || true
+            echo "No decompile jar found"
+            # Try listing all paperweight cache dirs
+            echo "--- paperweight cache directory tree ---"
+            find paper-server/.gradle/caches/paperweight -maxdepth 3 -type d -not -path "*/oldPaper/*" 2>/dev/null | head -30 || true
           fi
 
       - name: Upload patch log
